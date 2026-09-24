@@ -26,21 +26,13 @@ uv run --script --locked /path/to/codex-app-tools/codex_app.py send THREAD_ID --
 
 ## Use as a submodule
 
-For a shared Git remote:
+Add this repository to a consuming project:
 
 ```bash
-git submodule add <repository-url> tools/codex-app-tools
+git submodule add https://github.com/windyd/codex-app-tools.git tools/codex-app-tools
 git commit -m "Add Codex App tools"
 uv run --script --locked tools/codex-app-tools/codex_app.py --cwd "$PWD" list
 ```
-
-For same-host use before a remote is configured, the initial local source is `/home/kevin/Project/codex-app-tools`:
-
-```bash
-git -c protocol.file.allow=always submodule add /home/kevin/Project/codex-app-tools tools/codex-app-tools
-```
-
-Other machines need a reachable remote URL; the local path is not portable across hosts. Set a remote and publish the standalone repository before switching consuming projects with `git submodule set-url tools/codex-app-tools <repository-url>`.
 
 After cloning a consuming project, initialize the pinned revision:
 
@@ -48,7 +40,7 @@ After cloning a consuming project, initialize the pinned revision:
 git submodule update --init --recursive
 ```
 
-For a trusted local-path source, add `-c protocol.file.allow=always` to that Git command. This is a per-command setting. A consuming project's Git link pins the tool commit; updating the standalone repository alone does not change consumers. To update a consumer, fetch in the submodule, check out the desired commit, then stage and commit its Git link in the parent repository.
+A consuming project's Git link pins the tool commit; updating the standalone repository alone does not change consumers. To update a consumer, fetch in the submodule, check out the desired commit, then stage and commit its Git link in the parent repository.
 
 ## Thread lifecycle and approvals
 
