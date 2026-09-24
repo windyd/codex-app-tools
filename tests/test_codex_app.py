@@ -344,3 +344,129 @@ def test_move_does_not_claim_success_if_readback_differs():
     client.thread_read.return_value = SimpleNamespace(thread=fake_thread(Path("/repo")))
     with pytest.raises(RuntimeError, match="not confirmed"):
         app.move_section(client, "thread", "s")
+
+
+def reject_git_z(monkeypatch):
+    original = app.git_output
+
+    def git_output(cwd, *args):
+        if args == ("worktree", "list", "--porcelain", "-z"):
+            raise app.GitCommandError(
+                cwd, SimpleNamespace(returncode=129, stderr="error: unknown switch `z'\n")
+            )
+        return original(cwd, *args)
+
+    monkeypatch.setattr(app, "git_output", git_output)
+
+
+@pytest.mark.parametrize("name", ["space here", "工作树", 'quote"back\\slash', "trailing space "])
+def test_git_without_z_validates_registered_worktree(monkeypatch, worktree, name):
+    import subprocess
+
+    target = worktree.parent / name
+    subprocess.run(
+        ["git", "-C", str(worktree), "worktree", "move", str(worktree), str(target)], check=True
+    )
+    reject_git_z(monkeypatch)
+    assert app.validate_worktree(target) == target
+
+
+def test_git_without_z_rejects_ambiguous_newline_path(monkeypatch, worktree):
+    import subprocess
+
+    target = worktree.parent / "newline\npath"
+    subprocess.run(
+        ["git", "-C", str(worktree), "worktree", "move", str(worktree), str(target)], check=True
+    )
+    assert app.validate_worktree(target) == target
+    reject_git_z(monkeypatch)
+    with pytest.raises(ValueError, match="Newline-bearing"):
+        app.validate_worktree(target)
+
+
+def test_git_other_failure_does_not_fall_back(monkeypatch, worktree):
+    original = app.git_output
+    calls = []
+
+    def git_output(cwd, *args):
+        calls.append(args)
+        if args == ("worktree", "list", "--porcelain", "-z"):
+            raise app.GitCommandError(
+                cwd, SimpleNamespace(returncode=128, stderr="fatal: Permission denied")
+            )
+        return original(cwd, *args)
+
+    monkeypatch.setattr(app, "git_output", git_output)
+    with pytest.raises(app.GitCommandError, match="Permission denied"):
+        app.validate_worktree(worktree)
+    assert ("worktree", "list", "--porcelain") not in calls
+
+
+def test_section_query_paginates_without_project_or_source_filter():
+    client = Mock()
+    client.thread_list.side_effect = [
+        SimpleNamespace(data=[], next_cursor="next"),
+        SimpleNamespace(data=[SimpleNamespace(id="target")], next_cursor=None),
+    ]
+    assert [t.id for t in app.list_threads(client, None, section_id="s")] == ["target"]
+    for call in client.thread_list.call_args_list:
+        assert call.args[0]["sectionId"] == "s"
+        assert "cwd" not in call.args[0]
+        assert "sourceKinds" not in call.args[0]
+    assert client.thread_list.call_args.args[0]["cursor"] == "next"
+
+
+def task_client_for_section():
+    client = Mock()
+    thread = fake_thread(Path("/project"), {"id": "s", "name": "Batch"})
+    client.turn_start.return_value = SimpleNamespace(turn=SimpleNamespace(id="turn"))
+    client.next_turn_notification.return_value = completed()
+    client.thread_read.return_value = SimpleNamespace(thread=thread)
+    return client, thread
+
+
+def test_section_read_success_alone_does_not_verify_filtered_list(monkeypatch, capsys):
+    client, thread = task_client_for_section()
+    monkeypatch.setattr(app, "find_visible", lambda *_: thread)
+    monkeypatch.setattr(app.time, "sleep", lambda _: None)
+    client.thread_list.return_value = SimpleNamespace(data=[], next_cursor=None)
+    with pytest.raises(RuntimeError, match="requested server section"):
+        app.run_task(client, "new-thread", "prompt", Path("/project"), section_id="s")
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    checks = [e for e in events if e["event"] == "section.verification"]
+    assert len(checks) == 3
+    assert all(e["server_section_assigned"] and not e["server_section_listed"] for e in checks)
+    assert all(e["app_sidebar_verification"] == "not_performed" for e in checks)
+    client.turn_start.assert_called_once()
+
+
+def test_success_only_claims_server_list_and_membership(monkeypatch, capsys):
+    client, thread = task_client_for_section()
+    monkeypatch.setattr(app, "find_visible", lambda *_: thread)
+    client.thread_list.return_value = SimpleNamespace(data=[thread], next_cursor=None)
+    app.run_task(client, "new-thread", "prompt", Path("/project"), section_id="s")
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    visible = next(e for e in events if e["event"] == "visible")
+    assert visible["scope"] == "server_default_thread_list"
+    assert visible["app_sidebar_verification"] == "not_performed"
+    verified = events[-1]
+    assert verified["event"] == "section.verification"
+    assert verified["server_section_assigned"] is True
+    assert verified["server_section_listed"] is True
+    assert verified["app_sidebar_verification"] == "not_performed"
+
+
+def test_section_change_after_task_is_not_reported_as_success(monkeypatch, capsys):
+    client, thread = task_client_for_section()
+    monkeypatch.setattr(app, "find_visible", lambda *_: thread)
+    monkeypatch.setattr(app.time, "sleep", lambda _: None)
+    client.thread_read.return_value = SimpleNamespace(thread=fake_thread(Path("/project")))
+    client.thread_list.return_value = SimpleNamespace(data=[thread], next_cursor=None)
+    with pytest.raises(RuntimeError, match="task has already run"):
+        app.run_task(client, "new-thread", "prompt", Path("/project"), section_id="s")
+    checks = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if json.loads(line)["event"] == "section.verification"
+    ]
+    assert all(not e["server_section_assigned"] for e in checks)

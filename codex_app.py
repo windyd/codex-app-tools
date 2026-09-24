@@ -8,6 +8,7 @@
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -39,14 +40,22 @@ class ExplicitCwd(argparse.Action):
         namespace.cwd_explicit = True
 
 
+class GitCommandError(ValueError):
+    def __init__(self, cwd, result):
+        self.returncode = result.returncode
+        self.stderr = result.stderr
+        super().__init__(f"Invalid Git worktree {cwd}: {result.stderr.strip()}")
+
+
 def git_output(cwd, *args):
     # Do not let inherited Git overrides validate an unrelated repository.
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["LC_ALL"] = "C"
     result = subprocess.run(
         ["git", "-C", str(cwd), *args], capture_output=True, text=True, env=env, timeout=15
     )
     if result.returncode:
-        raise ValueError(f"Invalid Git worktree {cwd}: {result.stderr.strip()}")
+        raise GitCommandError(cwd, result)
     return result.stdout
 
 
@@ -54,10 +63,23 @@ def validate_worktree(path):
     path = path.expanduser().resolve(strict=True)
     if not path.is_dir():
         raise ValueError("--worktree must be a directory")
-    root = Path(git_output(path, "rev-parse", "--show-toplevel").strip()).resolve()
+    root = Path(git_output(path, "rev-parse", "--show-toplevel").removesuffix("\n")).resolve()
     if root != path:
         raise ValueError("--worktree must name the worktree root, not a subdirectory")
-    entries = git_output(path, "worktree", "list", "--porcelain", "-z").split("\0")
+    try:
+        entries = git_output(path, "worktree", "list", "--porcelain", "-z").split("\0")
+    except GitCommandError as error:
+        if error.returncode != 129 or not re.search(
+            r"unknown (?:switch|option) [`'\"]z['\"]", error.stderr
+        ):
+            raise
+        # Git 2.34 has no -z. Its worktree paths are raw, not C-quoted, so
+        # newline-bearing paths cannot be safely validated by splitting lines.
+        if "\n" in str(path) or "\r" in str(path):
+            raise ValueError(
+                "Newline-bearing worktree paths require Git with list -z support"
+            ) from error
+        entries = git_output(path, "worktree", "list", "--porcelain").split("\n")
     registered = [Path(e[9:]).resolve() for e in entries if e.startswith("worktree ")]
     if path not in registered:
         raise ValueError(f"Not a registered Git worktree: {path}")
@@ -67,7 +89,7 @@ def validate_worktree(path):
 def worktree_for_cwd(cwd):
     """Report local Git association when available; threads may also use non-Git cwd."""
     try:
-        root = Path(git_output(cwd, "rev-parse", "--show-toplevel").strip())
+        root = Path(git_output(cwd, "rev-parse", "--show-toplevel").removesuffix("\n"))
         return str(validate_worktree(root))
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return None
@@ -157,10 +179,14 @@ def summary(thread):
     }
 
 
-def list_threads(client, cwd, sources=None):
-    params = {"cwd": str(cwd), "limit": 100}
+def list_threads(client, cwd, sources=None, section_id=None):
+    params = {"limit": 100}
+    if cwd is not None:
+        params["cwd"] = str(cwd)
     if sources:
         params["sourceKinds"] = sources
+    if section_id is not None:
+        params["sectionId"] = section_id
     while True:
         result = client.thread_list(params)
         yield from result.data
@@ -171,6 +197,27 @@ def list_threads(client, cwd, sources=None):
 
 def find_visible(client, cwd, thread_id):
     return next((row for row in list_threads(client, cwd) if row.id == thread_id), None)
+
+
+def verify_section_listing(client, thread_id, section_id):
+    """Check two server views, never claim the desktop sidebar was observed."""
+    actual = summary(client.thread_read(thread_id).thread).get("section")
+    assigned = bool(actual and actual.get("id") == section_id)
+    listed = next(
+        (row for row in list_threads(client, None, section_id=section_id) if row.id == thread_id),
+        None,
+    )
+    listed_section = summary(listed).get("section") if listed is not None else None
+    in_section = bool(listed_section and listed_section.get("id") == section_id)
+    emit(
+        "section.verification",
+        thread_id=thread_id,
+        section_id=section_id,
+        server_section_assigned=assigned,
+        server_section_listed=in_section,
+        app_sidebar_verification="not_performed",
+    )
+    return assigned and in_section
 
 
 def wait_for_turn(client, turn_id):
@@ -190,11 +237,17 @@ def wait_for_turn(client, turn_id):
         client.unregister_turn_notifications(turn_id)
 
 
-def run_task(client, thread_id, prompt, cwd):
+def run_task(client, thread_id, prompt, cwd, section_id=None):
     turn = client.turn_start(thread_id, prompt).turn
     emit("turn.started", thread_id=thread_id, turn_id=turn.id)
     visible = find_visible(client, cwd, thread_id)
-    emit("visibility", thread_id=thread_id, listed_by_default=visible is not None)
+    emit(
+        "visibility",
+        thread_id=thread_id,
+        listed_by_default=visible is not None,
+        scope="server_default_thread_list",
+        app_sidebar_verification="not_performed",
+    )
     completed = wait_for_turn(client, turn.id)
     emit("turn.completed", thread_id=thread_id, status=completed["status"])
     if completed["status"] != "completed":
@@ -202,11 +255,23 @@ def run_task(client, thread_id, prompt, cwd):
     for attempt in range(3):
         visible = find_visible(client, cwd, thread_id)
         if visible:
-            emit("visible", thread=summary(visible))
-            return
+            emit(
+                "visible",
+                thread_id=thread_id,
+                thread=summary(visible),
+                scope="server_default_thread_list",
+                listed_by_default=True,
+                app_sidebar_verification="not_performed",
+            )
+            if section_id is None or verify_section_listing(client, thread_id, section_id):
+                return
         if attempt < 2:
             time.sleep(1)
-    raise RuntimeError(f"Turn completed, but thread {thread_id} is absent from the default list")
+    raise RuntimeError(
+        f"Turn completed, but thread {thread_id} was not confirmed in the default list"
+        + (f" and requested server section {section_id}" if section_id else "")
+        + "; the task has already run. App sidebar verification was not performed."
+    )
 
 
 def nonempty(value):
@@ -232,6 +297,7 @@ def parse_args():
     commands = parser.add_subparsers(dest="command", required=True)
     listing = commands.add_parser("list", help="List project threads; default App sources only")
     listing.add_argument("--source", action="append", help="Override source filter, e.g. exec")
+    listing.add_argument("--section-id", type=nonempty, help="Filter the server list by section ID")
     commands.add_parser("sections", help="List server-wide App sections (not project-scoped)")
     move = commands.add_parser("move", help="Move an existing thread to an existing App section")
     move.add_argument("thread_id")
@@ -289,7 +355,15 @@ def main():
             stage = "section.validate"
             section = resolve_section(client, args.section_id)
         if args.command == "list":
-            emit("threads", threads=[summary(t) for t in list_threads(client, cwd, args.source)])
+            emit(
+                "threads",
+                scope="server_thread_list",
+                section_id=args.section_id,
+                app_sidebar_verification="not_performed",
+                threads=[
+                    summary(t) for t in list_threads(client, cwd, args.source, args.section_id)
+                ],
+            )
         elif args.command == "sections":
             stage = "section.list"
             emit(
@@ -310,6 +384,8 @@ def main():
                 cwd=summary(thread)["cwd"],
                 worktree=worktree_for_cwd(actual_cwd),
                 section=section_details(section),
+                server_section_assigned=True,
+                app_sidebar_verification="not_performed",
             )
         elif args.command == "read":
             emit("thread", thread=summary(client.thread_read(args.thread_id).thread))
@@ -370,9 +446,12 @@ def main():
                 cwd=summary(thread)["cwd"],
                 worktree=str(worktree) if worktree else None,
                 section=section_details(section) if section else summary(thread)["section"],
+                server_section_assigned=True if section else None,
+                app_sidebar_verification="not_performed",
             )
             stage = "task.run"
-            run_task(client, thread.id, prompt, Path(summary(thread)["cwd"]))
+            options = {"section_id": section.id} if section else {}
+            run_task(client, thread.id, prompt, Path(summary(thread)["cwd"]), **options)
         return 0
     except KeyboardInterrupt:
         print("Client disconnected. Check or stop the task in the Codex App.", file=sys.stderr)
