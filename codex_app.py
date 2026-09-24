@@ -8,12 +8,121 @@
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 from openai_codex import CodexError
 from openai_codex.client import CodexClient, CodexConfig
+from openai_codex.errors import JsonRpcError
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class Section(BaseModel):
+    id: str
+    name: str
+
+
+class SectionPage(BaseModel):
+    data: list[Section]
+    next_cursor: str | None = Field(default=None, alias="nextCursor")
+
+
+class EmptyResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+
+class ExplicitCwd(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        namespace.cwd = values
+        namespace.cwd_explicit = True
+
+
+def git_output(cwd, *args):
+    # Do not let inherited Git overrides validate an unrelated repository.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    result = subprocess.run(
+        ["git", "-C", str(cwd), *args], capture_output=True, text=True, env=env, timeout=15
+    )
+    if result.returncode:
+        raise ValueError(f"Invalid Git worktree {cwd}: {result.stderr.strip()}")
+    return result.stdout
+
+
+def validate_worktree(path):
+    path = path.expanduser().resolve(strict=True)
+    if not path.is_dir():
+        raise ValueError("--worktree must be a directory")
+    root = Path(git_output(path, "rev-parse", "--show-toplevel").strip()).resolve()
+    if root != path:
+        raise ValueError("--worktree must name the worktree root, not a subdirectory")
+    entries = git_output(path, "worktree", "list", "--porcelain", "-z").split("\0")
+    registered = [Path(e[9:]).resolve() for e in entries if e.startswith("worktree ")]
+    if path not in registered:
+        raise ValueError(f"Not a registered Git worktree: {path}")
+    return path
+
+
+def worktree_for_cwd(cwd):
+    """Report local Git association when available; threads may also use non-Git cwd."""
+    try:
+        root = Path(git_output(cwd, "rev-parse", "--show-toplevel").strip())
+        return str(validate_worktree(root))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def list_sections(client):
+    params = {"limit": 100}
+    cursors = set()
+    while True:
+        try:
+            page = client.request("threadSection/list", params, response_model=SectionPage)
+        except JsonRpcError as error:
+            if error.code == -32601:
+                raise RuntimeError(
+                    "This App Server does not support threadSection/list; "
+                    "section operations require a compatible server. No database fallback."
+                ) from error
+            raise
+        yield from page.data
+        if not page.next_cursor:
+            return
+        if page.next_cursor in cursors:
+            raise RuntimeError("Section pagination returned a repeated cursor")
+        cursors.add(page.next_cursor)
+        params = {**params, "cursor": page.next_cursor}
+
+
+def section_details(section):
+    # 0.156.1 sections are server-wide, with no owning project in the protocol.
+    return {"id": section.id, "name": section.name, "scope": "server", "project_id": None}
+
+
+def resolve_section(client, section_id):
+    section = next((s for s in list_sections(client) if s.id == section_id), None)
+    if section is None:
+        raise ValueError(f"Section does not exist on this App Server: {section_id}")
+    return section
+
+
+def move_section(client, thread_id, section_id):
+    try:
+        client.request(
+            "thread/section/move",
+            {"threadId": thread_id, "sectionId": section_id},
+            response_model=EmptyResponse,
+        )
+    except JsonRpcError as error:
+        if error.code == -32601:
+            raise RuntimeError("This App Server does not support thread/section/move") from error
+        raise
+    thread = client.thread_read(thread_id).thread
+    actual = summary(thread).get("section")
+    if not actual or actual.get("id") != section_id:
+        raise RuntimeError(f"Section assignment was not confirmed for thread {thread_id}")
+    return thread
 
 
 def reject_client_request(method, params):
@@ -42,7 +151,10 @@ def emit(event, **fields):
 
 def summary(thread):
     data = thread.model_dump(by_alias=True, mode="json")
-    return {key: data.get(key) for key in ("id", "name", "source", "cwd", "status")}
+    return {
+        key: data.get(key)
+        for key in ("id", "name", "source", "cwd", "status", "gitInfo", "projectId", "section")
+    }
 
 
 def list_threads(client, cwd, sources=None):
@@ -113,11 +225,17 @@ def parse_args():
         "--cwd",
         type=Path,
         default=Path.cwd(),
+        action=ExplicitCwd,
         help="Project filter / new thread cwd (default: current directory)",
     )
+    parser.set_defaults(cwd_explicit=False)
     commands = parser.add_subparsers(dest="command", required=True)
     listing = commands.add_parser("list", help="List project threads; default App sources only")
     listing.add_argument("--source", action="append", help="Override source filter, e.g. exec")
+    commands.add_parser("sections", help="List server-wide App sections (not project-scoped)")
+    move = commands.add_parser("move", help="Move an existing thread to an existing App section")
+    move.add_argument("thread_id")
+    move.add_argument("--section-id", type=nonempty, required=True)
     commands.add_parser("read", help="Read thread metadata without resuming").add_argument(
         "thread_id"
     )
@@ -130,6 +248,11 @@ def parse_args():
             command.add_argument("thread_id")
         if name != "send":
             command.add_argument("--name", type=nonempty, required=True)
+        if name == "create":
+            command.add_argument("--worktree", type=Path, help="Existing registered worktree root")
+            command.add_argument(
+                "--section-id", type=nonempty, help="Existing server-wide section ID"
+            )
         prompt = command.add_mutually_exclusive_group(required=True)
         prompt.add_argument("--prompt", type=nonempty)
         prompt.add_argument("--prompt-file", type=Path, help="UTF-8 task file; - reads stdin")
@@ -139,8 +262,17 @@ def parse_args():
 def main():
     parser, args = parse_args()
     client = None
+    thread_id = getattr(args, "thread_id", None)
+    actual_cwd = None
+    worktree = None
+    section = None
+    stage = "validate"
     try:
-        cwd = args.cwd.expanduser().resolve(strict=True)
+        if getattr(args, "worktree", None) is not None:
+            worktree = validate_worktree(args.worktree)
+            if args.cwd_explicit and args.cwd.expanduser().resolve(strict=True) != worktree:
+                raise ValueError("--cwd and --worktree must resolve to the same directory")
+        cwd = worktree or args.cwd.expanduser().resolve(strict=True)
         if not cwd.is_dir():
             parser.error("--cwd must be a directory")
         prompt = getattr(args, "prompt", None)
@@ -149,11 +281,36 @@ def main():
             prompt = sys.stdin.read() if str(prompt_file) == "-" else prompt_file.read_text("utf-8")
             if not prompt.strip():
                 parser.error("Task prompt must not be empty")
+        stage = "connect"
         client = create_client(args.socket.expanduser())
         client.start()
         client.initialize()
+        if getattr(args, "section_id", None):
+            stage = "section.validate"
+            section = resolve_section(client, args.section_id)
         if args.command == "list":
             emit("threads", threads=[summary(t) for t in list_threads(client, cwd, args.source)])
+        elif args.command == "sections":
+            stage = "section.list"
+            emit(
+                "sections",
+                scope="server",
+                project_id=None,
+                sections=[section_details(s) for s in list_sections(client)],
+            )
+        elif args.command == "move":
+            thread_id = args.thread_id
+            stage = "section.move"
+            thread = move_section(client, thread_id, section.id)
+            actual_cwd = summary(thread)["cwd"]
+            emit(
+                "section.moved",
+                thread_id=thread_id,
+                thread=summary(thread),
+                cwd=summary(thread)["cwd"],
+                worktree=worktree_for_cwd(actual_cwd),
+                section=section_details(section),
+            )
         elif args.command == "read":
             emit("thread", thread=summary(client.thread_read(args.thread_id).thread))
         elif args.command == "rename":
@@ -161,6 +318,7 @@ def main():
             emit("renamed", thread_id=args.thread_id, name=args.name)
         else:
             if args.command == "create":
+                stage = "thread.create"
                 result = client.thread_start(
                     {
                         "cwd": str(cwd),
@@ -171,6 +329,7 @@ def main():
                     }
                 )
             elif args.command == "fork":
+                stage = "thread.fork"
                 result = client.thread_fork(
                     args.thread_id,
                     {
@@ -179,18 +338,55 @@ def main():
                     },
                 )
             else:
+                stage = "thread.resume"
                 result = client.thread_resume(args.thread_id, {"excludeTurns": True})
             thread = result.thread
-            emit("thread.ready", thread=summary(thread))
+            thread_id = thread.id
+            actual_cwd = summary(thread)["cwd"]
+            emit(
+                "thread.created" if args.command == "create" else "thread.loaded",
+                thread_id=thread_id,
+                cwd=summary(thread)["cwd"],
+                worktree=str(worktree) if worktree else None,
+                requested_section_id=getattr(args, "section_id", None),
+                thread=summary(thread),
+            )
+            stage = "cwd.verify"
+            if args.command == "create" and Path(summary(thread)["cwd"]).resolve() != cwd:
+                raise RuntimeError("App Server returned a different cwd; task was not started")
             if args.command != "send":
+                stage = "thread.rename"
                 client.thread_set_name(thread.id, args.name)
                 emit("renamed", thread_id=thread.id, name=args.name)
+            if section:
+                stage = "section.move"
+                thread = move_section(client, thread_id, section.id)
+                if Path(summary(thread)["cwd"]).resolve() != cwd:
+                    raise RuntimeError("Thread cwd changed during section assignment")
+            emit(
+                "thread.ready",
+                thread_id=thread_id,
+                thread=summary(thread),
+                cwd=summary(thread)["cwd"],
+                worktree=str(worktree) if worktree else None,
+                section=section_details(section) if section else summary(thread)["section"],
+            )
+            stage = "task.run"
             run_task(client, thread.id, prompt, Path(summary(thread)["cwd"]))
         return 0
     except KeyboardInterrupt:
         print("Client disconnected. Check or stop the task in the Codex App.", file=sys.stderr)
         return 130
-    except (OSError, RuntimeError, ValueError, CodexError) as error:
+    except (OSError, RuntimeError, ValueError, CodexError, subprocess.TimeoutExpired) as error:
+        emit(
+            "error",
+            stage=stage,
+            thread_id=thread_id,
+            cwd=actual_cwd,
+            requested_section_id=getattr(args, "section_id", None),
+            worktree=str(worktree) if worktree else None,
+            message=str(error),
+        )
         print(f"Error: {error}", file=sys.stderr)
         return 1
     finally:

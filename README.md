@@ -1,6 +1,6 @@
 # Codex App tools
 
-Manage App-visible Codex threads through an existing local App Server. This standalone CLI uses the official Python SDK and a small stdio-to-Unix-WebSocket bridge. It provides `list`, `read`, `rename`, `create`, `fork`, and `send`.
+Manage App-visible Codex threads through an existing local App Server. This standalone CLI uses the official Python SDK and a small stdio-to-Unix-WebSocket bridge. It provides `list`, `read`, `rename`, `create`, `fork`, `send`, `sections`, and `move`.
 
 ## Requirements and execution
 
@@ -49,6 +49,33 @@ New threads use `workspace-write`, `on-request`, and `auto_review`; no model ove
 Task commands emit JSONL metadata and public replies, and keep the SDK connection open until the turn completes. Initial `visibility` can be false while persistence catches up; successful completion includes a `visible` event. For long-running tasks, preserve the client process and its output log. Ctrl-C disconnects the client without explicitly interrupting the remote turn; check the App for its state.
 
 The tool does not automatically accept client-side approval or user-input requests. It reports unsupported interaction requests so they can be handled in the App. The bridge disables WebSocket compression because the tested server rejects negotiation for that extension.
+
+## Existing worktrees and App sections
+
+```bash
+uv run --script --locked codex_app.py --cwd /path/to/project sections
+uv run --script --locked codex_app.py create \
+  --worktree /path/to/existing-worktree \
+  --section-id SECTION_ID \
+  --name "B01 · GT-14327 · Search refresh" --prompt-file task.md
+uv run --script --locked codex_app.py move THREAD_ID --section-id SECTION_ID
+```
+
+`--worktree` accepts an existing, registered Git worktree root, including the main working tree. Missing paths, bare repositories, non-Git directories, and subdirectories of a worktree are rejected before connecting. Symlinks are resolved. The tool neither creates nor deletes worktrees. It sends the resolved path as the actual `thread/start.cwd` and checks the returned cwd before starting a task. Explicit `--cwd` and `--worktree` must resolve to the same directory; otherwise creation fails. When `--cwd` is omitted, `--worktree` replaces the caller-directory default. Relative prompt files still resolve from the caller's directory.
+
+Sections in the verified App Server protocol are **server-wide, independent of projects**. `sections` lists all sections on the selected server, with `id`, `name`, `scope: "server"`, and `project_id: null`; `--cwd` does not filter them. There is no owning-project field or project/section mismatch to validate in this version. The tool does not invent ownership from member threads. Only IDs are accepted, so duplicate section names are unambiguous. Unknown IDs fail, and groups are never created automatically.
+
+Creation validates the destination section before `thread/start`, emits `thread.created` with the new ID, sets the name, calls `thread/section/move`, and verifies the section through `thread/read` **before** `turn/start`. `thread.ready` reports `thread_id`, actual `cwd`, the selected `worktree`, and `section`. `move` changes membership without resuming or sending a turn and verifies the result. Its `worktree` is resolved from the stored cwd when Git metadata is locally available, otherwise null.
+
+Failures exit nonzero and emit a JSONL `error` with `stage`, `thread_id` when known, `cwd`, `worktree`, and `requested_section_id`. A grouping failure leaves the created thread available but sends no prompt. Do not retry `create` blindly: repair with `move THREAD_ID --section-id ...`, then use `send THREAD_ID --prompt-file ...`. If transport fails during `thread.create` before the response arrives, the ID can be unknown; inspect the App/list before retrying. A `task.run` failure may occur after the task has started.
+
+### Verified compatibility and limits
+
+Verified on 2026-09-24 with the existing **Codex Desktop App Server 0.156.1**, protocol schema from **codex-cli 0.156.1** (including experimental fields), **openai-codex 0.155.1**, and **websockets 17.1**. The SDK's public `request` method handles `threadSection/list` and `thread/section/move`, which lack dedicated helpers in this SDK. Missing methods produce an explicit error; the tool never edits Codex databases or restarts the server.
+
+An integration test created a thread in a linked worktree, verified section membership before its first turn, received its reply, found it in the default thread list with matching cwd/Git metadata, and moved it to another existing section. The test thread was subsequently ungrouped and archived. Desktop clicking/rendering was not visually tested. This associates an existing checkout through the server's real cwd; it does not register the checkout in an App-managed worktree lifecycle or promise an App-specific worktree badge. The protocol exposes no separate worktree-registration parameter.
+
+Protocol reference: [Codex App Server](https://developers.openai.com/codex/app-server). To inspect the installed runtime's exact schema without starting another server, run `codex app-server generate-json-schema --experimental --out /path/to/schema`.
 
 ## Development and validation
 
